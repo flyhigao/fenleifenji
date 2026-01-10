@@ -1,0 +1,81 @@
+import os
+import json
+from swift.llm import SwiftInfer
+
+# ================= 配置区 =================
+# 1. 设置显卡
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+
+# 2. 模型路径 (指向你 Step 1 训练完输出的 checkpoint 文件夹)
+# 例如: '/home/gao/my_swift_project/output/step1_translation/checkpoint-500'
+ckpt_dir = '/home/gao/my_swift_project/output/fenleifenji_step1/checkpoint-16560'
+
+# 3. 输入文件 (prepare_step1_dataset.py 生成的那个 null 文件)
+input_file = '/home/gao/fenleifenji/yiliao/combined.csvdescnull.json'
+
+# 4. 输出文件 (生成的补全文件)
+output_file = 'step2_predicted_desc.jsonl'
+
+# 5. System Prompt (必须和 Step 1 训练时完全一致！)
+SYSTEM_PROMPT = (
+    "你是一个医疗数据治理领域的元数据解析专家。"
+    "你的任务是根据数据库表名和字段名（可能是拼音首字母、英文缩写或混合编码），"
+    "结合医疗业务上下文，精准推断并输出其对应的中文业务含义（字段注释）。"
+    "直接输出中文含义即可，无需解释。"
+)
+
+# ================= 执行逻辑 =================
+def predict_desc():
+    if not os.path.exists(ckpt_dir):
+        print(f"错误: 找不到模型路径 {ckpt_dir}")
+        return
+    if not os.path.exists(input_file):
+        print(f"错误: 找不到输入文件 {input_file}")
+        return
+
+    print(f"正在加载模型: {ckpt_dir} ...")
+    # 加载模型
+    infer_engine = SwiftInfer(ckpt_dir=ckpt_dir)
+
+    print("开始批量推理补全...")
+    
+    results = []
+    
+    # 读取待处理数据
+    # 注意: 之前的脚本生成的是 jsonl (每行一个json)
+    with open(input_file, 'r', encoding='utf-8') as f:
+        lines = f.readlines()
+
+    total = len(lines)
+    
+    for i, line in enumerate(lines):
+        if not line.strip(): continue
+        
+        entry = json.loads(line)
+        query = entry['query'] # tablename:xx; colname:xx
+        
+        # 推理
+        resp = infer_engine.infer([query], system=SYSTEM_PROMPT)
+        predicted_text = resp[0]['response']
+        
+        # 构造结果：保留原始信息，增加预测结果
+        new_record = entry.copy()
+        new_record['predicted_desc'] = predicted_text  # 存入预测结果
+        
+        results.append(new_record)
+        
+        if (i+1) % 10 == 0:
+            print(f"[{i+1}/{total}] 输入: {query} -> 预测: {predicted_text}")
+
+    # 保存结果
+    with open(output_file, 'w', encoding='utf-8') as f:
+        for item in results:
+            f.write(json.dumps(item, ensure_ascii=False) + '\n')
+
+    print("-" * 50)
+    print(f"完成！已生成 {len(results)} 条补全数据。")
+    print(f"输出文件: {output_file}")
+    print("下一步建议：将此文件转换为 Excel 或 CSV，进行人工快速核对。")
+
+if __name__ == "__main__":
+    predict_desc()

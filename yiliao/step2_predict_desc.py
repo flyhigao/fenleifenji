@@ -1,22 +1,20 @@
 import os
 import json
-from swift.llm import SwiftInfer
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from swift import Swift
 
 # ================= 配置区 =================
-# 1. 设置显卡
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
-# 2. 模型路径 (指向你 Step 1 训练完输出的 checkpoint 文件夹)
-# 例如: '/home/gao/my_swift_project/output/step1_translation/checkpoint-500'
-ckpt_dir = '/home/gao/my_swift_project/output/你的Step1输出目录/checkpoint-xxx'
+# 1. Checkpoint 路径 (请确认路径正确)
+ckpt_dir = '/home/gao/my_swift_project/output/fenleifenji_step1/checkpoint-16560'
 
-# 3. 输入文件 (prepare_step1_dataset.py 生成的那个 null 文件)
+# 2. 输入/输出文件
 input_file = '/home/gao/fenleifenji/yiliao/combined.csvdescnull.json'
-
-# 4. 输出文件 (生成的补全文件)
 output_file = 'step2_predicted_desc.jsonl'
 
-# 5. System Prompt (必须和 Step 1 训练时完全一致！)
+# 3. System Prompt
 SYSTEM_PROMPT = (
     "你是一个医疗数据治理领域的元数据解析专家。"
     "你的任务是根据数据库表名和字段名（可能是拼音首字母、英文缩写或混合编码），"
@@ -24,58 +22,121 @@ SYSTEM_PROMPT = (
     "直接输出中文含义即可，无需解释。"
 )
 
-# ================= 执行逻辑 =================
-def predict_desc():
-    if not os.path.exists(ckpt_dir):
-        print(f"错误: 找不到模型路径 {ckpt_dir}")
-        return
-    if not os.path.exists(input_file):
-        print(f"错误: 找不到输入文件 {input_file}")
-        return
+def get_base_model_path(ckpt_dir):
 
-    print(f"正在加载模型: {ckpt_dir} ...")
-    # 加载模型
-    infer_engine = SwiftInfer(ckpt_dir=ckpt_dir)
+    return '/root/.cache/modelscope/hub/models/Qwen/Qwen3-8B'
 
-    print("开始批量推理补全...")
+    """从 args.json 中读取底座模型路径"""
+    args_path = os.path.join(ckpt_dir, 'sft_args.json')
+    if not os.path.exists(args_path):
+        # 兼容旧版文件名为 args.json
+        args_path = os.path.join(ckpt_dir, 'args.json')
     
-    results = []
+    if os.path.exists(args_path):
+        with open(args_path, 'r') as f:
+            args = json.load(f)
+            # 优先尝试读取 model_id_or_path，如果没有则尝试 model
+            return args.get('model_id_or_path', args.get('model', 'Qwen/Qwen3-8B'))
+    return 'Qwen/Qwen3-8B' # 保底默认值
+
+def predict():
+    # 1. 自动获取底座模型名称
+    base_model_path = get_base_model_path(ckpt_dir)
+    print(f"检测到底座模型: {base_model_path}")
+    print(f"正在加载 LoRA 权重: {ckpt_dir}")
+
+    # 2. 加载分词器
+    tokenizer = AutoTokenizer.from_pretrained(
+        base_model_path, 
+        trust_remote_code=True
+    )
+
+    # 3. 加载模型 (原生 Transformers)
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model_path,
+        device_map="auto",
+        torch_dtype=torch.float16, # 显存不够可改为 bfloat16 或 load_in_8bit=True
+        trust_remote_code=True
+    )
+
+    # 4. 加载 Swift LoRA 权重
+    model = Swift.from_pretrained(model, ckpt_dir, inference_mode=True)
     
-    # 读取待处理数据
-    # 注意: 之前的脚本生成的是 jsonl (每行一个json)
+    print("模型加载成功！开始推理...")
+
+    # 读取输入
     with open(input_file, 'r', encoding='utf-8') as f:
         lines = f.readlines()
 
+    f_out = open(output_file, 'w', encoding='utf-8')
+    
+    # 进度条
     total = len(lines)
     
     for i, line in enumerate(lines):
         if not line.strip(): continue
         
-        entry = json.loads(line)
-        query = entry['query'] # tablename:xx; colname:xx
-        
-        # 推理
-        resp = infer_engine.infer([query], system=SYSTEM_PROMPT)
-        predicted_text = resp[0]['response']
-        
-        # 构造结果：保留原始信息，增加预测结果
-        new_record = entry.copy()
-        new_record['predicted_desc'] = predicted_text  # 存入预测结果
-        
-        results.append(new_record)
-        
-        if (i+1) % 10 == 0:
-            print(f"[{i+1}/{total}] 输入: {query} -> 预测: {predicted_text}")
+        try:
+            entry = json.loads(line)
+            # 兼容 query / raw_data
+            if 'query' in entry:
+                query = entry['query']
+            elif 'raw_data' in entry:
+                uri = entry['raw_data'].get('uri', '').strip()
+                name = entry['raw_data'].get('name', '').strip()
+                query = f"tablename:{uri}; colname:{name}"
+            else:
+                continue
+            
+            # --- 构造 Qwen3 格式的 Prompt ---
+            # 手动拼接 ChatML 格式，确保与 Swift 内部模板一致
+            # <|im_start|>system\n...<|im_end|>\n<|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": query}
+            ]
+            text = tokenizer.apply_chat_template(
+                messages, 
+                tokenize=False, 
+                add_generation_prompt=True
+            )
+            
+            # 编码
+            model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
+            
+            # 生成
+            generated_ids = model.generate(
+                model_inputs.input_ids,
+                max_new_tokens=128,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                temperature=0.1, # 低温，保证确定性
+                top_p=0.9
+            )
+            
+            # 解码 (只取生成的回复部分)
+            generated_ids = [
+                output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+            ]
+            response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            
+            # 保存
+            new_record = entry.copy()
+            new_record['predicted_desc'] = response.strip()
+            new_record['query'] = query # 补全 query 方便后续使用
+            
+            f_out.write(json.dumps(new_record, ensure_ascii=False) + '\n')
+            f_out.flush()
+            
+            if (i+1) % 10 == 0:
+                print(f"[{i+1}/{total}] {response}")
 
-    # 保存结果
-    with open(output_file, 'w', encoding='utf-8') as f:
-        for item in results:
-            f.write(json.dumps(item, ensure_ascii=False) + '\n')
+        except Exception as e:
+            print(f"Error line {i}: {e}")
+            continue
 
-    print("-" * 50)
-    print(f"完成！已生成 {len(results)} 条补全数据。")
-    print(f"输出文件: {output_file}")
-    print("下一步建议：将此文件转换为 Excel 或 CSV，进行人工快速核对。")
+    f_out.close()
+    print(f"完成！结果已保存在 {output_file}")
 
 if __name__ == "__main__":
-    predict_desc()
+    predict()
